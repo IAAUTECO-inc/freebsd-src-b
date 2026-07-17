@@ -249,10 +249,12 @@ sbp_targ_probe(device_t dev)
 {
 	device_t pa;
 
-	pa = device_get_parent(dev);
-	if (device_get_unit(dev) != device_get_unit(pa)) {
+	if (fw_get_unit(dev) != NULL)
 		return (ENXIO);
-	}
+
+	pa = device_get_parent(dev);
+	if (device_get_unit(dev) != device_get_unit(pa))
+		return (ENXIO);
 
 	device_set_desc(dev, "SBP-2/SCSI over FireWire target mode");
 	return (0);
@@ -1949,7 +1951,7 @@ sbp_targ_attach(device_t dev)
 	bzero((void *)sc, sizeof(struct sbp_targ_softc));
 
 	mtx_init(&sc->mtx, "sbp_targ", NULL, MTX_DEF);
-	sc->fd.fc = fc = device_get_ivars(dev);
+	sc->fd.fc = fc = fw_get_comm(dev);
 	sc->fd.dev = dev;
 	sc->fd.post_explore = (void *) sbp_targ_post_explore;
 	sc->fd.post_busreset = (void *) sbp_targ_post_busreset;

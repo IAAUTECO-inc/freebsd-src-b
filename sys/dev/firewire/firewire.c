@@ -86,12 +86,16 @@ static int firewire_detach(device_t);
 static int firewire_resume(device_t);
 static void firewire_xfer_timeout(void *, int);
 static device_t firewire_add_child(device_t, u_int, const char *, int);
+static void firewire_child_deleted(device_t, device_t);
 static void fw_try_bmr(void *);
 static void fw_try_bmr_callback(struct fw_xfer *);
 static void fw_asystart(struct fw_xfer *);
 static int fw_get_tlabel(struct firewire_comm *, struct fw_xfer *);
 static void fw_bus_probe(void *);
 static void fw_attach_dev(struct firewire_comm *);
+static void fw_parse_units(struct fw_device *);
+static void fw_create_unit_children(struct firewire_comm *, struct fw_device *);
+static int fw_remove_unit_children(struct firewire_comm *, struct fw_device *);
 static void fw_bus_probe_thread(void *);
 #ifdef FW_VMACCESS
 static void fw_vmaccess (struct fw_xfer *);
@@ -111,6 +115,7 @@ static device_method_t firewire_methods[] = {
 
 	/* Bus interface */
 	DEVMETHOD(bus_add_child,	firewire_add_child),
+	DEVMETHOD(bus_child_deleted,	firewire_child_deleted),
 
 	DEVMETHOD_END
 };
@@ -473,15 +478,37 @@ firewire_add_child(device_t dev, u_int order, const char *name, int unit)
 {
 	device_t child;
 	struct firewire_softc *sc;
+	struct fw_child_ivars *iv;
 
 	sc = device_get_softc(dev);
 	child = device_add_child(dev, name, unit);
 	if (child) {
-		device_set_ivars(child, sc->fc);
+		iv = malloc(sizeof(*iv), M_FW, M_NOWAIT | M_ZERO);
+		if (iv == NULL) {
+			device_delete_child(dev, child);
+			return (NULL);
+		}
+		iv->type = FW_CHILD_BUS;
+		iv->u.fc = sc->fc;
+		device_set_ivars(child, iv);
 		device_probe_and_attach(child);
 	}
 
 	return child;
+}
+
+static void
+firewire_child_deleted(device_t dev, device_t child)
+{
+	struct fw_child_ivars *iv;
+
+	iv = device_get_ivars(child);
+	if (iv != NULL) {
+		if (iv->type == FW_CHILD_UNIT && iv->u.unit != NULL)
+			iv->u.unit->dev = NULL;
+		free(iv, M_FW);
+		device_set_ivars(child, NULL);
+	}
 }
 
 static int
@@ -522,6 +549,13 @@ firewire_detach(device_t dev)
 
 	if ((err = fwdev_destroydev(sc)) != 0)
 		return err;
+
+	/* Remove unit children before bus_generic_detach */
+	for (fwdev = STAILQ_FIRST(&fc->devices); fwdev != NULL;
+	     fwdev = fwdev_next) {
+		fwdev_next = STAILQ_NEXT(fwdev, link);
+		fw_remove_unit_children(fc, fwdev);
+	}
 
 	if ((err = bus_generic_detach(dev)) != 0)
 		return err;
@@ -721,13 +755,22 @@ fw_busreset(struct firewire_comm *fc, uint32_t new_status)
 
 	fw_reset_crom(fc);
 
+	/*
+	 * Skip unit children; only bus-level children have post_busreset.
+	 */
 	if (device_get_children(fc->bdev, &devlistp, &devcnt) == 0) {
-		for (i = 0; i < devcnt; i++)
-			if (device_get_state(devlistp[i]) >= DS_ATTACHED) {
-				fdc = device_get_softc(devlistp[i]);
-				if (fdc->post_busreset != NULL)
-					fdc->post_busreset(fdc);
-			}
+		for (i = 0; i < devcnt; i++) {
+			struct fw_child_ivars *iv;
+
+			if (device_get_state(devlistp[i]) < DS_ATTACHED)
+				continue;
+			iv = fw_get_ivars(devlistp[i]);
+			if (iv == NULL || iv->type != FW_CHILD_BUS)
+				continue;
+			fdc = device_get_softc(devlistp[i]);
+			if (fdc->post_busreset != NULL)
+				fdc->post_busreset(fdc);
+		}
 		free(devlistp, M_TEMP);
 	}
 
@@ -1585,6 +1628,7 @@ fw_explore_node(struct fw_device *dfwdev)
 		fwdev->dst = dfwdev->dst;
 		fwdev->maxrec = dfwdev->maxrec;
 		fwdev->status = dfwdev->status;
+		STAILQ_INIT(&fwdev->units);
 
 		/*
 		 * Pre-1394a-2000 didn't have link_spd in
@@ -1638,10 +1682,17 @@ fw_explore_node(struct fw_device *dfwdev)
 		fwdev->status = FWDEVINIT;
 		/* unchanged ? */
 		if (bcmp(&csr[0], &fwdev->csrrom[0], sizeof(uint32_t) * 5) == 0) {
-			if (firewire_debug)
-				device_printf(fc->dev,
-				    "node%d: crom unchanged\n", node);
-			return (0);
+			if (!STAILQ_EMPTY(&fwdev->units)) {
+				if (firewire_debug)
+					device_printf(fc->dev,
+					    "node%d: crom unchanged\n", node);
+				fwdev->rom_changed = 0;
+				return (0);
+			}
+			/* Units lost after detach/reattach; re-parse. */
+			fwdev->rom_changed = 0;
+		} else {
+			fwdev->rom_changed = 1;
 		}
 	}
 
@@ -1764,6 +1815,136 @@ fw_bus_probe_thread(void *arg)
 	kproc_exit(0);
 }
 
+static void
+fw_parse_units(struct fw_device *fwdev)
+{
+	struct csrhdr *hdr;
+	struct csrdirectory *rootdir, *udir;
+	struct csrreg *ureg;
+	struct fw_unit *unit;
+	uint32_t spec_id, sw_version;
+	uint32_t rom_quads, root_off, root_len;
+	uint32_t reg_off, udir_qoff, udir_len;
+	int ri, ui, uindex;
+
+	rom_quads = CSRROMSIZE / 4;
+	hdr = (struct csrhdr *)fwdev->csrrom;
+	if (hdr->info_len <= 1)
+		return;
+
+	root_off = 1 + hdr->info_len;
+	if (root_off >= rom_quads)
+		return;
+	rootdir = (struct csrdirectory *)&fwdev->csrrom[root_off];
+	root_len = rootdir->crc_len;
+	if (root_off + 1 + root_len > rom_quads)
+		return;
+
+	uindex = 0;
+	for (ri = 0; ri < (int)root_len; ri++) {
+		reg_off = root_off + 1 + ri;
+		if (reg_off >= rom_quads)
+			break;
+		if (rootdir->entry[ri].key != CROM_UDIR)
+			continue;
+
+		udir_qoff = reg_off + rootdir->entry[ri].val;
+		if (udir_qoff >= rom_quads)
+			continue;
+		udir = (struct csrdirectory *)&fwdev->csrrom[udir_qoff];
+		udir_len = udir->crc_len;
+		if (udir_qoff + 1 + udir_len > rom_quads)
+			continue;
+
+		spec_id = 0;
+		sw_version = 0;
+		for (ui = 0; ui < (int)udir_len; ui++) {
+			if (udir_qoff + 1 + ui >= rom_quads)
+				break;
+			ureg = &udir->entry[ui];
+			if (ureg->key == CSRKEY_SPEC)
+				spec_id = ureg->val;
+			else if (ureg->key == CSRKEY_VER)
+				sw_version = ureg->val;
+		}
+		if (spec_id == 0 && sw_version == 0)
+			continue;
+
+		unit = malloc(sizeof(*unit), M_FW, M_NOWAIT | M_ZERO);
+		if (unit == NULL)
+			continue;
+		unit->fwdev = fwdev;
+		unit->spec_id = spec_id;
+		unit->sw_version = sw_version;
+		unit->dir_offset = udir_qoff * 4;
+		STAILQ_INSERT_TAIL(&fwdev->units, unit, link);
+		uindex++;
+	}
+	if (firewire_debug && uindex > 0)
+		device_printf(fwdev->fc->bdev,
+		    "node %d: %d unit director%s found\n",
+		    fwdev->dst, uindex, uindex == 1 ? "y" : "ies");
+}
+
+static void
+fw_create_unit_children(struct firewire_comm *fc, struct fw_device *fwdev)
+{
+	struct fw_unit *unit;
+	struct fw_child_ivars *iv;
+
+	bus_topo_lock();
+	STAILQ_FOREACH(unit, &fwdev->units, link) {
+		if (unit->dev != NULL)
+			continue;
+		unit->dev = device_add_child(fc->bdev, NULL, DEVICE_UNIT_ANY);
+		if (unit->dev == NULL) {
+			device_printf(fc->bdev,
+			    "failed to add unit child for node %d\n",
+			    fwdev->dst);
+			continue;
+		}
+		iv = malloc(sizeof(*iv), M_FW, M_NOWAIT | M_ZERO);
+		if (iv == NULL) {
+			device_delete_child(fc->bdev, unit->dev);
+			unit->dev = NULL;
+			continue;
+		}
+		iv->type = FW_CHILD_UNIT;
+		iv->u.unit = unit;
+		device_set_ivars(unit->dev, iv);
+		if (firewire_debug)
+			device_printf(fc->bdev,
+			    "node %d: unit spec=0x%06x ver=0x%06x\n",
+			    fwdev->dst, unit->spec_id, unit->sw_version);
+		device_probe_and_attach(unit->dev);
+	}
+	bus_topo_unlock();
+}
+
+static int
+fw_remove_unit_children(struct firewire_comm *fc, struct fw_device *fwdev)
+{
+	struct fw_unit *unit, *next;
+	int err, ret;
+
+	ret = 0;
+	bus_topo_lock();
+	STAILQ_FOREACH_SAFE(unit, &fwdev->units, link, next) {
+		if (unit->dev != NULL) {
+			err = device_delete_child(fc->bdev, unit->dev);
+			if (err != 0) {
+				ret = err;
+				continue;
+			}
+			unit->dev = NULL;
+		}
+		STAILQ_REMOVE(&fwdev->units, unit, fw_unit, link);
+		free(unit, M_FW);
+	}
+	bus_topo_unlock();
+	return (ret);
+}
+
 /*
  * To attach sub-devices layer onto IEEE1394 bus.
  */
@@ -1780,6 +1961,15 @@ fw_attach_dev(struct firewire_comm *fc)
 		next = STAILQ_NEXT(fwdev, link);
 		if (fwdev->status == FWDEVINIT) {
 			fwdev->status = FWDEVATTACHED;
+			if (fwdev->rom_changed &&
+			    !STAILQ_EMPTY(&fwdev->units)) {
+				if (fw_remove_unit_children(fc, fwdev) == 0)
+					fwdev->rom_changed = 0;
+			}
+			if (STAILQ_EMPTY(&fwdev->units)) {
+				fw_parse_units(fwdev);
+			}
+			fw_create_unit_children(fc, fwdev);
 		} else if (fwdev->status == FWDEVINVAL) {
 			fwdev->rcnt++;
 			if (firewire_debug)
@@ -1791,6 +1981,8 @@ fw_attach_dev(struct firewire_comm *fc)
 				 * Remove devices which have not been seen
 				 * for a while.
 				 */
+				if (fw_remove_unit_children(fc, fwdev) != 0)
+					continue;
 				STAILQ_REMOVE(&fc->devices, fwdev, fw_device,
 				    link);
 				free(fwdev, M_FW);
@@ -1801,11 +1993,16 @@ fw_attach_dev(struct firewire_comm *fc)
 	err = device_get_children(fc->bdev, &devlistp, &devcnt);
 	if (err == 0) {
 		for (i = 0; i < devcnt; i++) {
-			if (device_get_state(devlistp[i]) >= DS_ATTACHED) {
-				fdc = device_get_softc(devlistp[i]);
-				if (fdc->post_explore != NULL)
-					fdc->post_explore(fdc);
-			}
+			struct fw_child_ivars *iv;
+
+			if (device_get_state(devlistp[i]) < DS_ATTACHED)
+				continue;
+			iv = fw_get_ivars(devlistp[i]);
+			if (iv == NULL || iv->type != FW_CHILD_BUS)
+				continue;
+			fdc = device_get_softc(devlistp[i]);
+			if (fdc->post_explore != NULL)
+				fdc->post_explore(fdc);
 		}
 		free(devlistp, M_TEMP);
 	}

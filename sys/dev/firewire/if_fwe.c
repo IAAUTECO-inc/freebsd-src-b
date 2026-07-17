@@ -123,10 +123,12 @@ fwe_probe(device_t dev)
 {
 	device_t pa;
 
-	pa = device_get_parent(dev);
-	if (device_get_unit(dev) != device_get_unit(pa)) {
+	if (fw_get_unit(dev) != NULL)
 		return (ENXIO);
-	}
+
+	pa = device_get_parent(dev);
+	if (device_get_unit(dev) != device_get_unit(pa))
+		return (ENXIO);
 
 	device_set_desc(dev, "Ethernet over FireWire");
 	return (0);
@@ -150,7 +152,7 @@ fwe_attach(device_t dev)
 	fwe->stream_ch = stream_ch;
 	fwe->dma_ch = -1;
 
-	fwe->fd.fc = device_get_ivars(dev);
+	fwe->fd.fc = fw_get_comm(dev);
 	if (tx_speed < 0)
 		tx_speed = fwe->fd.fc->speed;
 
