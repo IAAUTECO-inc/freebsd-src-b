@@ -982,9 +982,7 @@ fw_bindremove(struct firewire_comm *fc, struct fw_bind *fwb)
 	struct fw_xfer *xfer, *next;
 #endif
 	struct fw_bind *tfw;
-	int s;
 
-	s = splfw();
 	FW_GLOCK(fc);
 	STAILQ_FOREACH(tfw, &fc->binds, fclist)
 		if (tfw == fwb) {
@@ -994,7 +992,6 @@ fw_bindremove(struct firewire_comm *fc, struct fw_bind *fwb)
 
 	printf("%s: no such binding\n", __func__);
 	FW_GUNLOCK(fc);
-	splx(s);
 	return (1);
 found:
 #if 0
@@ -1007,7 +1004,6 @@ found:
 #endif
 	FW_GUNLOCK(fc);
 
-	splx(s);
 	return 0;
 }
 
@@ -1016,7 +1012,7 @@ fw_xferlist_add(struct fw_xferlist *q, struct malloc_type *type,
     int slen, int rlen, int n,
     struct firewire_comm *fc, void *sc, void (*hand)(struct fw_xfer *))
 {
-	int i, s;
+	int i;
 	struct fw_xfer *xfer;
 
 	for (i = 0; i < n; i++) {
@@ -1026,9 +1022,7 @@ fw_xferlist_add(struct fw_xferlist *q, struct malloc_type *type,
 		xfer->fc = fc;
 		xfer->sc = sc;
 		xfer->hand = hand;
-		s = splfw();
 		STAILQ_INSERT_TAIL(q, xfer, link);
-		splx(s);
 	}
 	return (n);
 }
@@ -1451,9 +1445,7 @@ fw_bus_probe(void *arg)
 {
 	struct firewire_comm *fc;
 	struct fw_device *fwdev;
-	int s;
 
-	s = splfw();
 	fc = arg;
 	fc->status = FWBUSEXPLORE;
 
@@ -1476,7 +1468,6 @@ fw_bus_probe(void *arg)
 					"Dev ID: %08x%08x already invalid\n",
 					__func__, fwdev->eui.hi, fwdev->eui.lo);
 		}
-	splx(s);
 
 	wakeup(fc);
 }
@@ -1737,7 +1728,7 @@ fw_find_self_id(struct firewire_comm *fc, int node)
 static void
 fw_explore(struct firewire_comm *fc)
 {
-	int node, err, s, i, todo, todo2, trys;
+	int node, err, i, todo, todo2, trys;
 	char nodes[63];
 	struct fw_device dfwdev;
 	union fw_self_id *fwsid;
@@ -1773,7 +1764,6 @@ fw_explore(struct firewire_comm *fc)
 		nodes[todo++] = node;
 	}
 
-	s = splfw();
 	for (trys = 0; todo > 0 && trys < 3; trys++) {
 		todo2 = 0;
 		for (i = 0; i < todo; i++) {
@@ -1788,7 +1778,6 @@ fw_explore(struct firewire_comm *fc)
 		}
 		todo = todo2;
 	}
-	splx(s);
 }
 
 static void
@@ -2018,10 +2007,8 @@ fw_get_tlabel(struct firewire_comm *fc, struct fw_xfer *xfer)
 {
 	u_int dst, new_tlabel;
 	struct fw_xfer *txfer;
-	int s;
 
 	dst = xfer->send.hdr.mode.hdr.dst & 0x3f;
-	s = splfw();
 	mtx_lock(&fc->tlabel_lock);
 	new_tlabel = (fc->last_tlabel[dst] + 1) & 0x3f;
 	STAILQ_FOREACH(txfer, &fc->tlabels[new_tlabel], tlabel)
@@ -2031,7 +2018,6 @@ fw_get_tlabel(struct firewire_comm *fc, struct fw_xfer *xfer)
 		fc->last_tlabel[dst] = new_tlabel;
 		STAILQ_INSERT_TAIL(&fc->tlabels[new_tlabel], xfer, tlabel);
 		mtx_unlock(&fc->tlabel_lock);
-		splx(s);
 		xfer->tl = new_tlabel;
 		xfer->send.hdr.mode.hdr.tlrt = new_tlabel << 2;
 		if (firewire_debug > 1)
@@ -2039,7 +2025,6 @@ fw_get_tlabel(struct firewire_comm *fc, struct fw_xfer *xfer)
 		return (new_tlabel);
 	}
 	mtx_unlock(&fc->tlabel_lock);
-	splx(s);
 
 	if (firewire_debug > 1)
 		printf("fw_get_tlabel: no free tlabel\n");
@@ -2272,10 +2257,8 @@ fw_rcv(struct fw_rcv_buf *rb)
 		if (rb->xfer == NULL)
 			return;
 		fw_rcv_copy(rb)
-		s = splfw();
 		xferq->queued++;
 		STAILQ_INSERT_TAIL(&xferq->q, rb->xfer, link);
-		splx(s);
 		sc = device_get_softc(rb->fc->bdev);
 		if (SEL_WAITING(&xferq->rsel))
 			selwakeuppri(&xferq->rsel, FWPRI);

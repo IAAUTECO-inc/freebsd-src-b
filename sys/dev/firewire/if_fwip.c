@@ -150,7 +150,7 @@ fwip_attach(device_t dev)
 {
 	struct fwip_softc *fwip;
 	if_t ifp;
-	int unit, s;
+	int unit;
 	struct fw_hwaddr *hwaddr;
 
 	fwip = ((struct fwip_softc *)device_get_softc(dev));
@@ -195,9 +195,7 @@ fwip_attach(device_t dev)
 	if_setcapabilitiesbit(ifp, IFCAP_POLLING, 0);
 #endif
 
-	s = splimp();
 	firewire_ifattach(ifp, hwaddr);
-	splx(s);
 
 	FWIPDEBUG(ifp, "interface created\n");
 	return (0);
@@ -244,7 +242,6 @@ fwip_detach(device_t dev)
 {
 	struct fwip_softc *fwip;
 	if_t ifp;
-	int s;
 
 	fwip = (struct fwip_softc *)device_get_softc(dev);
 	ifp = fwip->fw_softc.fwip_ifp;
@@ -254,14 +251,11 @@ fwip_detach(device_t dev)
 		ether_poll_deregister(ifp);
 #endif
 
-	s = splimp();
-
 	fwip_stop(fwip);
 	firewire_ifdetach(ifp);
 	if_free(ifp);
 	mtx_destroy(&fwip->mtx);
 
-	splx(s);
 	return 0;
 }
 
@@ -357,11 +351,10 @@ static int
 fwip_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
 	struct fwip_softc *fwip = ((struct fwip_eth_softc *)if_getsoftc(ifp))->fwip;
-	int s, error;
+	int error;
 
 	switch (cmd) {
 	case SIOCSIFFLAGS:
-		s = splimp();
 		if (if_getflags(ifp) & IFF_UP) {
 			if (!(if_getdrvflags(ifp) & IFF_DRV_RUNNING))
 				fwip_init(&fwip->fw_softc);
@@ -369,7 +362,6 @@ fwip_ioctl(if_t ifp, u_long cmd, caddr_t data)
 			if (if_getdrvflags(ifp) & IFF_DRV_RUNNING)
 				fwip_stop(fwip);
 		}
-		splx(s);
 		break;
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
@@ -387,9 +379,7 @@ fwip_ioctl(if_t ifp, u_long cmd, caddr_t data)
 #endif /* DEVICE_POLLING */
 		break;
 	default:
-		s = splimp();
 		error = firewire_ioctl(ifp, cmd, data);
-		splx(s);
 		return (error);
 	}
 
@@ -432,7 +422,6 @@ fwip_output_callback(struct fw_xfer *xfer)
 {
 	struct fwip_softc *fwip;
 	if_t ifp;
-	int s;
 
 	fwip = (struct fwip_softc *)xfer->sc;
 	ifp = fwip->fw_softc.fwip_ifp;
@@ -443,11 +432,9 @@ fwip_output_callback(struct fw_xfer *xfer)
 	m_freem(xfer->mbuf);
 	fw_xfer_unload(xfer);
 
-	s = splimp();
 	FWIP_LOCK(fwip);
 	STAILQ_INSERT_TAIL(&fwip->xferlist, xfer, link);
 	FWIP_UNLOCK(fwip);
-	splx(s);
 
 	/* for queue full */
 	if (!if_sendq_empty(ifp)) {
@@ -459,28 +446,23 @@ static void
 fwip_start(if_t ifp)
 {
 	struct fwip_softc *fwip = ((struct fwip_eth_softc *)if_getsoftc(ifp))->fwip;
-	int s;
 
 	FWIPDEBUG(ifp, "starting\n");
 
 	if (fwip->dma_ch < 0) {
 		FWIPDEBUG(ifp, "not ready\n");
 
-		s = splimp();
 		fw_net_drain_sendq(ifp);
-		splx(s);
 
 		return;
 	}
 
-	s = splimp();
 	if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
 
 	if (!if_sendq_empty(ifp))
 		fwip_async_output(fwip, ifp);
 
 	if_setdrvflagbits(ifp, 0, IFF_DRV_OACTIVE);
-	splx(s);
 }
 
 /* Async. stream output */

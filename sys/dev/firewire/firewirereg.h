@@ -42,8 +42,6 @@ typedef	struct thread fw_proc;
 #include <sys/mutex.h>
 #include <sys/taskqueue.h>
 
-#define	splfw splimp
-
 STAILQ_HEAD(fw_xferlist, fw_xfer);
 
 struct fw_device {

@@ -1402,11 +1402,8 @@ sbp_targ_action1(struct cam_sim *sim, union ccb *ccb)
 static void
 sbp_targ_action(struct cam_sim *sim, union ccb *ccb)
 {
-	int s;
 
-	s = splfw();
 	sbp_targ_action1(sim, ccb);
-	splx(s);
 }
 
 static void
@@ -1784,7 +1781,6 @@ static void
 sbp_targ_resp_callback(struct fw_xfer *xfer)
 {
 	struct sbp_targ_softc *sc;
-	int s;
 
 	if (debug)
 		printf("%s: xfer=%p\n", __func__, xfer);
@@ -1792,9 +1788,7 @@ sbp_targ_resp_callback(struct fw_xfer *xfer)
 	fw_xfer_unload(xfer);
 	xfer->recv.pay_len = SBP_TARG_RECV_LEN;
 	xfer->hand = sbp_targ_recv;
-	s = splfw();
 	STAILQ_INSERT_TAIL(&sc->fwb.xferlist, xfer, link);
-	splx(s);
 }
 
 static int
@@ -1901,10 +1895,9 @@ sbp_targ_recv(struct fw_xfer *xfer)
 	struct fw_pkt *fp, *sfp;
 	struct fw_device *fwdev;
 	uint32_t lo;
-	int s, rtcode;
+	int rtcode;
 	struct sbp_targ_softc *sc;
 
-	s = splfw();
 	sc = (struct sbp_targ_softc *)xfer->sc;
 	fp = &xfer->recv.hdr;
 	fwdev = fw_noderesolve_nodeid(sc->fd.fc, fp->mode.wreqb.src & 0x3f);
@@ -1937,7 +1930,6 @@ done:
 	sfp->mode.wres.pri = 0;
 
 	fw_asyreq(xfer->fc, -1, xfer);
-	splx(s);
 }
 
 static int

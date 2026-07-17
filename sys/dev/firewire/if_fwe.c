@@ -139,7 +139,7 @@ fwe_attach(device_t dev)
 {
 	struct fwe_softc *fwe;
 	if_t ifp;
-	int unit, s;
+	int unit;
 	u_char eaddr[6];
 	struct fw_eui64 *eui;
 
@@ -190,9 +190,7 @@ fwe_attach(device_t dev)
 	if_setflags(ifp, (IFF_BROADCAST|IFF_SIMPLEX|IFF_MULTICAST));
 	if_setsendqlen(ifp, TX_MAX_QUEUE);
 
-	s = splimp();
 	ether_ifattach(ifp, eaddr);
-	splx(s);
 
         /* Tell the upper layer(s) we support long frames. */
 	if_setifheaderlen(ifp, sizeof(struct ether_vlan_header));
@@ -242,7 +240,6 @@ fwe_detach(device_t dev)
 {
 	struct fwe_softc *fwe;
 	if_t ifp;
-	int s;
 
 	fwe = device_get_softc(dev);
 	ifp = fwe->eth_softc.ifp;
@@ -251,13 +248,11 @@ fwe_detach(device_t dev)
 	if (if_getcapenable(ifp) & IFCAP_POLLING)
 		ether_poll_deregister(ifp);
 #endif
-	s = splimp();
 
 	fwe_stop(fwe);
 	ether_ifdetach(ifp);
 	if_free(ifp);
 
-	splx(s);
 	mtx_destroy(&fwe->mtx);
 	return 0;
 }
@@ -336,11 +331,10 @@ fwe_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
 	struct fwe_softc *fwe = ((struct fwe_eth_softc *)if_getsoftc(ifp))->fwe;
 	struct ifstat *ifs = NULL;
-	int s, error;
+	int error;
 
 	switch (cmd) {
 		case SIOCSIFFLAGS:
-			s = splimp();
 			if (if_getflags(ifp) & IFF_UP) {
 				if (!(if_getdrvflags(ifp) & IFF_DRV_RUNNING))
 					fwe_init(&fwe->eth_softc);
@@ -350,18 +344,15 @@ fwe_ioctl(if_t ifp, u_long cmd, caddr_t data)
 			}
 			/* XXX keep promiscoud mode */
 			if_setflagbits(ifp, IFF_PROMISC, 0);
-			splx(s);
 			break;
 		case SIOCADDMULTI:
 		case SIOCDELMULTI:
 			break;
 
 		case SIOCGIFSTATUS:
-			s = splimp();
 			ifs = (struct ifstat *)data;
 			snprintf(ifs->ascii, sizeof(ifs->ascii),
 			    "\tch %d dma %d\n",	fwe->stream_ch, fwe->dma_ch);
-			splx(s);
 			break;
 		case SIOCSIFCAP:
 #ifdef DEVICE_POLLING
@@ -376,9 +367,7 @@ fwe_ioctl(if_t ifp, u_long cmd, caddr_t data)
 #endif /* DEVICE_POLLING */
 			break;
 		default:
-			s = splimp();
 			error = ether_ioctl(ifp, cmd, data);
-			splx(s);
 			return (error);
 	}
 
@@ -390,7 +379,6 @@ fwe_output_callback(struct fw_xfer *xfer)
 {
 	struct fwe_softc *fwe;
 	if_t ifp;
-	int s;
 
 	fwe = (struct fwe_softc *)xfer->sc;
 	ifp = fwe->eth_softc.ifp;
@@ -401,11 +389,9 @@ fwe_output_callback(struct fw_xfer *xfer)
 	m_freem(xfer->mbuf);
 	fw_xfer_unload(xfer);
 
-	s = splimp();
 	FWE_LOCK(fwe);
 	STAILQ_INSERT_TAIL(&fwe->xferlist, xfer, link);
 	FWE_UNLOCK(fwe);
-	splx(s);
 
 	/* for queue full */
 	if (!if_sendq_empty(ifp))
@@ -416,28 +402,23 @@ static void
 fwe_start(if_t ifp)
 {
 	struct fwe_softc *fwe = ((struct fwe_eth_softc *)if_getsoftc(ifp))->fwe;
-	int s;
 
 	FWEDEBUG(ifp, "starting\n");
 
 	if (fwe->dma_ch < 0) {
 		FWEDEBUG(ifp, "not ready\n");
 
-		s = splimp();
 		fw_net_drain_sendq(ifp);
-		splx(s);
 
 		return;
 	}
 
-	s = splimp();
 	if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
 
 	if (!if_sendq_empty(ifp))
 		fwe_as_output(fwe, ifp);
 
 	if_setdrvflagbits(ifp, 0, IFF_DRV_OACTIVE);
-	splx(s);
 }
 
 #define HDR_LEN 4
