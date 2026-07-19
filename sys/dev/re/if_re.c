@@ -167,6 +167,8 @@ static int msix_disable = 0;
 TUNABLE_INT("hw.re.msix_disable", &msix_disable);
 static int prefer_iomap = 0;
 TUNABLE_INT("hw.re.prefer_iomap", &prefer_iomap);
+static int aspm_disable = 1;
+TUNABLE_INT("hw.re.aspm_disable", &aspm_disable);
 
 #define RE_CSUM_FEATURES    (CSUM_IP | CSUM_TCP | CSUM_UDP)
 
@@ -1369,8 +1371,14 @@ re_attach(device_t dev)
 		CSR_WRITE_1(sc, RL_EECMD, RL_EEMODE_OFF);
 	}
 
-	/* Disable ASPM L0S/L1 and CLKREQ. */
-	if (sc->rl_expcap != 0) {
+	/*
+	 * Disable ASPM L0S/L1 and CLKREQ.  ASPM is implicated in Tx
+	 * stalls and watchdog timeouts on many chip revisions, so it
+	 * is turned off by default; set the hw.re.aspm_disable tunable
+	 * to 0 to keep the firmware-configured ASPM state and trade
+	 * reliability under sustained load for link power management.
+	 */
+	if (aspm_disable != 0 && sc->rl_expcap != 0) {
 		cap = pci_read_config(dev, sc->rl_expcap +
 		    PCIER_LINK_CAP, 2);
 		if ((cap & PCIEM_LINK_CAP_ASPM) != 0) {
@@ -3658,11 +3666,12 @@ re_watchdog(struct rl_softc *sc)
 	}
 
 	/*
-	 * ASPM is a common cause of these Tx timeouts.  Make sure L0s/L1
+	 * ASPM is a common cause of these Tx timeouts.  Unless the
+	 * administrator has opted to keep ASPM enabled, make sure L0s/L1
 	 * and CLKREQ are still disabled on the link before reinitializing;
 	 * firmware or a power transition may have re-armed them.
 	 */
-	if (sc->rl_expcap != 0) {
+	if (aspm_disable != 0 && sc->rl_expcap != 0) {
 		uint16_t ctl;
 
 		ctl = pci_read_config(sc->rl_dev,
